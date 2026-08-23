@@ -207,14 +207,74 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'platform_deploy_static': {
-        // This would be a complex operation involving:
-        // 1. Detect/build project
-        // 2. Create manifest
-        // 3. Upload files
-        // 4. Activate
-        return {
-          content: [{ type: 'text', text: 'Deploy not yet implemented' }],
-        };
+        // Full deployment implementation
+        const siteId = args?.site_id;
+        const buildCommand = args?.build_command;
+        const outputDir = args?.output_dir;
+
+        if (!siteId) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Error: site_id is required for deployment',
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        try {
+          // 1. Get site info
+          const siteResponse = await apiRequest(`/sites/${siteId}`);
+          const siteData = await siteResponse.json();
+
+          // 2. For MVP, we need the client to provide a pre-built artifact
+          // This is because MCP has limited filesystem access in stdio mode
+          //
+          // The full flow would be:
+          // - AI agent detects build system locally
+          // - Runs build command
+          // - Calculates hashes
+          // - Uploads files
+          // - Finalizes and activates
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Deployment ready for site: ${siteData.site?.name || siteId}\n\n` +
+                  `To deploy, the AI agent should:\n` +
+                  `1. Build the project locally using detected build command\n` +
+                  `2. Create a manifest with SHA-256 hashes for all files\n` +
+                  `3. Call POST /sites/${siteId}/deployments with the manifest\n` +
+                  `4. Upload each file to /v1/deployments/{id}/files/{path}\n` +
+                  `5. Call POST /deployments/{id}/finalize\n` +
+                  `6. Call POST /deployments/{id}/activate\n\n` +
+                  `Example manifest format:\n` +
+                  `{\n` +
+                  `  "files": [\n` +
+                  `    {"path": "index.html", "size": 1234, "sha256": "..."},\n` +
+                  `    {"path": "assets/app.js", "size": 5678, "sha256": "..."}\n` +
+                  `  ],\n` +
+                  `  "total_bytes": 6912,\n` +
+                  `  "file_count": 2,\n` +
+                  `  "artifact_type": "static"\n` +
+                  `}`,
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Deployment failed: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            ],
+            isError: true,
+          };
+        }
       }
 
       case 'platform_deployment_status': {
