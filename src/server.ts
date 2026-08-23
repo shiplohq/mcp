@@ -227,7 +227,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           // 1. Get site info
           const siteResponse = await apiRequest(`/sites/${siteId}`);
-          const siteData = await siteResponse.json();
+          const siteData = await siteResponse.json() as { site?: { name?: string } };
 
           // 2. For MVP, we need the client to provide a pre-built artifact
           // This is because MCP has limited filesystem access in stdio mode
