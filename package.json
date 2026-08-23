@@ -1,0 +1,22 @@
+{
+  "name": "@shiplo/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "bin": {
+    "platform-mcp": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc && node dist/cli.js",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@shiplo/contracts": "*",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
