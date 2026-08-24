@@ -9,11 +9,13 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc && node dist/cli.js",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@shiplo/contracts": "*",
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -5,6 +5,9 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { statSync } from 'fs';
+import { isMediaFile } from '@shiplo/contracts';
+import { optimizeImage, optimizeVideo, VIDEO_EXTENSIONS } from './optimize.js';
 
 const API_BASE_URL = process.env.PLATFORM_API_BASE_URL || '';
 const API_TOKEN = process.env.PLATFORM_API_TOKEN || '';
@@ -96,7 +99,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'platform_deploy_static',
-        description: 'Build and deploy the current project as a static site',
+        description:
+          'Build and deploy the current project as a static site. Honors plan upload limits ' +
+          '(per-file size cap and account-wide file cap — call platform_account_status first ' +
+          'to get them); oversized images/videos trigger an interactive optimize-or-skip choice ' +
+          'for the user.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -113,6 +120,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: 'Output directory (optional, will auto-detect)',
             },
           },
+        },
+      },
+      {
+        name: 'platform_optimize_media',
+        description:
+          'Shrink an oversized local image or video file to fit a byte cap, in place ' +
+          '(images re-encode via sharp; videos via ffmpeg — available in the full MCP ' +
+          'build or when ffmpeg is on PATH). Call this after the user chose "optimize" ' +
+          'over "skip" for a file exceeding plan.max_file_size_bytes.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'Absolute path of the media file to optimize',
+            },
+            max_bytes: {
+              type: 'integer',
+              description: 'Target size cap in bytes (use plan.max_file_size_bytes)',
+              minimum: 1,
+            },
+          },
+          required: ['path', 'max_bytes'],
         },
       },
       {
@@ -245,12 +275,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 type: 'text',
                 text: `Deployment ready for site: ${siteData.site?.name || siteId}\n\n` +
                   `To deploy, the AI agent should:\n` +
+                  `0. Get the account's upload limits: call platform_account_status and read ` +
+                  `plan.max_file_size_bytes (per-file cap) and plan.max_total_files (account-wide file cap).\n` +
                   `1. Build the project locally using detected build command\n` +
-                  `2. Create a manifest with SHA-256 hashes for all files\n` +
-                  `3. Call POST /sites/${siteId}/deployments with the manifest\n` +
-                  `4. Upload each file to /v1/deployments/{id}/files/{path}\n` +
-                  `5. Call POST /deployments/{id}/finalize\n` +
-                  `6. Call POST /deployments/{id}/activate\n\n` +
+                  `2. Scan every file in the output directory BEFORE building the manifest:\n` +
+                  `   - Image/video file (jpg, jpeg, png, gif, webp, avif, svg, bmp, ico, mp4, webm, mov, mkv, avi, m4v) ` +
+                  `larger than max_file_size_bytes → ASK THE USER which they prefer per file: ` +
+                  `(a) optimize — call the platform_optimize_media tool with the file path and max_bytes; it ` +
+                  `re-encodes in place (images always work; video needs the full MCP build or system ffmpeg — ` +
+                  `the tool reports when unavailable), or ` +
+                  `(b) skip the file and deploy without it.\n` +
+                  `   - Non-media file (pdf, zip, fonts, etc.) larger than max_file_size_bytes → the server ` +
+                  `cannot optimize it: report the list of oversized files to the user and STOP. Do not silently drop them.\n` +
+                  `   - Total file count across the account would exceed max_total_files → report the cap to the user and STOP.\n` +
+                  `3. Create a manifest with SHA-256 hashes for all surviving files\n` +
+                  `4. Call POST /sites/${siteId}/deployments with the manifest\n` +
+                  `5. Upload each file to /v1/deployments/{id}/files/{path}\n` +
+                  `6. Call POST /deployments/{id}/finalize\n` +
+                  `7. Call POST /deployments/{id}/activate\n\n` +
+                  `The server enforces these limits authoritatively. If the API rejects with ` +
+                  `FILE_SIZE_LIMIT_EXCEEDED (details.files lists each oversized file with an is_media flag) ` +
+                  `or FILE_COUNT_LIMIT_EXCEEDED (details.limit), run the step-2 interaction above on the ` +
+                  `rejected files and retry with a corrected manifest.\n\n` +
                   `Example manifest format:\n` +
                   `{\n` +
                   `  "files": [\n` +
@@ -275,6 +321,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             isError: true,
           };
         }
+      }
+
+      case 'platform_optimize_media': {
+        const filePath = args?.path;
+        const maxBytes = args?.max_bytes;
+
+        if (typeof filePath !== 'string' || !filePath.startsWith('/')) {
+          return {
+            content: [{ type: 'text', text: 'Error: path must be an absolute file path' }],
+            isError: true,
+          };
+        }
+        if (typeof maxBytes !== 'number' || maxBytes < 1) {
+          return {
+            content: [{ type: 'text', text: 'Error: max_bytes must be a positive integer' }],
+            isError: true,
+          };
+        }
+        let size: number;
+        try {
+          size = statSync(filePath).size;
+        } catch {
+          return {
+            content: [{ type: 'text', text: `Error: file not found: ${filePath}` }],
+            isError: true,
+          };
+        }
+        if (!isMediaFile(filePath)) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: not a media file (checked extension). Offer the user skip: ${filePath}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = VIDEO_EXTENSIONS.some((ext) =>
+          filePath.toLowerCase().endsWith(ext)
+        )
+          ? await optimizeVideo(filePath, maxBytes)
+          : await optimizeImage(filePath, maxBytes);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          isError: !result.ok,
+        };
       }
 
       case 'platform_deployment_status': {
