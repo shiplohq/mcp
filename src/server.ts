@@ -6,10 +6,10 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { statSync } from 'fs';
-import { isMediaFile } from '@shiplo/contracts';
+import { isMediaFile } from '@shiplohq/contracts';
 import { optimizeImage, optimizeVideo, VIDEO_EXTENSIONS } from './optimize.js';
 
-const API_BASE_URL = process.env.PLATFORM_API_BASE_URL || '';
+const API_BASE_URL = process.env.PLATFORM_API_BASE_URL || 'https://shiplo.site/v1';
 const API_TOKEN = process.env.PLATFORM_API_TOKEN || '';
 
 // Create MCP server
