@@ -120,6 +120,11 @@ older clients.
 
 - Images are re-encoded in-process through `sharp` — no system dependencies needed.
 - Video optimization requires an `ffmpeg` binary: resolved from `ffmpeg-static` (when installed alongside) or from `PATH`. When neither is available, the tool reports skip as the only option.
+- No system ffmpeg? Install the full build [`@shiplohq/mcp-full`](full/README.md) — same server with an ffmpeg binary bundled via `ffmpeg-static`:
+
+  ```bash
+  claude mcp add platform-mcp-full --env PLATFORM_API_TOKEN=shp_your_token -- npx -y @shiplohq/mcp-full@latest
+  ```
 
 ## License
 

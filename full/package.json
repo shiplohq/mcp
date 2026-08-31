@@ -1,0 +1,26 @@
+{
+  "name": "@shiplohq/mcp-full",
+  "version": "0.1.0",
+  "description": "Full Shiplo MCP build — everything in @shiplohq/mcp plus a bundled ffmpeg binary for video optimization",
+  "license": "MIT",
+  "bin": {
+    "platform-mcp-full": "./bin/platform-mcp-full.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "dependencies": {
+    "@shiplohq/mcp": "^0.1.4",
+    "ffmpeg-static": "^5.2.0"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shiplohq/mcp.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
