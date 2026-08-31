@@ -35,7 +35,7 @@ class ShiploRequestError extends Error {
 const server = new Server(
   {
     name: 'shiplo-platform-mcp',
-    version: '0.1.3',
+    version: '0.1.4',
   },
   {
     capabilities: {
