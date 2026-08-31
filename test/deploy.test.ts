@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -43,6 +43,50 @@ const api = createServer(async (request: IncomingMessage, response: ServerRespon
     contentType: request.headers['content-type'],
     body,
   });
+
+  if (request.method === 'POST' && request.url === '/v1/sites') {
+    const input = JSON.parse(body.toString('utf8')) as { name: string; preferred_subdomain?: string };
+    if (input.preferred_subdomain === 'taken-project') {
+      return json(response, 409, {
+        error: { code: 'HOSTNAME_NOT_AVAILABLE', message: 'Hostname is not available' },
+      });
+    }
+    const slug = input.preferred_subdomain ?? 'generated-project-a1b2c3d4e5f6';
+    return json(response, 201, {
+      site: {
+        id: 'auto-site',
+        name: input.name,
+        slug,
+        status: 'active',
+        routing_mode: 'static',
+      },
+      hostnames: [{ hostname: `${slug}.shiplo.site`, is_primary: true }],
+    });
+  }
+  if (request.method === 'GET' && request.url === '/v1/sites/auto-site') {
+    return json(response, 200, {
+      site: { id: 'auto-site', name: 'fixture-project', slug: 'fixture-project', hostname: 'fixture-project.shiplo.site' },
+    });
+  }
+  if (request.method === 'GET' && request.url === '/v1/sites/stale-site') {
+    return json(response, 404, {
+      error: { code: 'NOT_FOUND', message: 'Site not found' },
+    });
+  }
+  if (request.method === 'POST' && request.url === '/v1/sites/auto-site/deployments') {
+    return json(response, 201, { deployment: { id: 'dep-auto' } });
+  }
+  if (request.method === 'PUT' && request.url?.startsWith('/v1/deployments/dep-auto/files/')) {
+    return json(response, 200, { uploaded: true });
+  }
+  if (request.method === 'POST' && request.url === '/v1/deployments/dep-auto/finalize') {
+    return json(response, 200, { release: { id: 'rel-auto' } });
+  }
+  if (request.method === 'POST' && request.url === '/v1/deployments/dep-auto/activate') {
+    return json(response, 200, {
+      deployment: { id: 'dep-auto', release_id: 'rel-auto', status: 'active' },
+    });
+  }
 
   if (request.method === 'GET' && request.url === '/v1/sites/site-123') {
     return json(response, 200, {
@@ -116,6 +160,263 @@ after(async () => {
   rmSync(TMP, { recursive: true, force: true });
 });
 
+test('first deployment creates project config before building and needs no arguments', async () => {
+  requests.length = 0;
+  const project = mkdtempSync(join(TMP, 'first-deploy-'));
+  writeFileSync(join(project, 'package.json'), JSON.stringify({
+    name: 'fixture-project',
+    scripts: { build: 'node build.mjs' },
+    devDependencies: { vite: '^7.0.0' },
+  }));
+  writeFileSync(join(project, 'build.mjs'), [
+    "import { existsSync, mkdirSync, writeFileSync } from 'node:fs';",
+    "if (!existsSync('.shiplo/project.json')) throw new Error('Shiplo config missing before build');",
+    "mkdirSync('dist', { recursive: true });",
+    "writeFileSync('dist/index.html', '<h1>First deploy</h1>');",
+  ].join('\n'));
+
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['--import', TSX_LOADER, CLI],
+    cwd: project,
+    env: {
+      ...process.env,
+      PLATFORM_API_BASE_URL: baseUrl,
+      PLATFORM_API_TOKEN: 'shp_test_token',
+    } as Record<string, string>,
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'first-deploy-client', version: '1.0.0' });
+
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({
+      name: 'platform_deploy_static',
+      arguments: {},
+    });
+
+    assert.equal(result.isError, undefined);
+    const content = result.content[0];
+    assert.equal(content.type, 'text');
+    assert.ok('text' in content);
+    assert.equal(JSON.parse(content.text).site_id, 'auto-site');
+  } finally {
+    await client.close();
+  }
+
+  assert.deepEqual(JSON.parse(readFileSync(join(project, '.shiplo', 'project.json'), 'utf8')), {
+    version: 1,
+    project_name: 'fixture-project',
+    site_id: 'auto-site',
+    subdomain: 'fixture-project',
+    build_command: 'npm run build',
+    output_dir: 'dist',
+  });
+  assert.deepEqual(
+    requests.map(({ method, url }) => `${method} ${url}`),
+    [
+      'POST /v1/sites',
+      'GET /v1/sites/auto-site',
+      'POST /v1/sites/auto-site/deployments',
+      'PUT /v1/deployments/dep-auto/files/index.html',
+      'POST /v1/deployments/dep-auto/finalize',
+      'POST /v1/deployments/dep-auto/activate',
+    ]
+  );
+});
+
+test('later deployment reuses saved project config without creating another site', async () => {
+  requests.length = 0;
+  const project = mkdtempSync(join(TMP, 'saved-config-'));
+  mkdirSync(join(project, '.shiplo'));
+  mkdirSync(join(project, 'dist'));
+  writeFileSync(join(project, 'dist', 'index.html'), '<h1>Saved config deploy</h1>');
+  writeFileSync(join(project, '.shiplo', 'project.json'), JSON.stringify({
+    version: 1,
+    project_name: 'Saved fixture',
+    site_id: 'site-123',
+    subdomain: 'fixture',
+    build_command: null,
+    output_dir: 'dist',
+  }));
+
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['--import', TSX_LOADER, CLI],
+    cwd: project,
+    env: {
+      ...process.env,
+      PLATFORM_API_BASE_URL: baseUrl,
+      PLATFORM_API_TOKEN: 'shp_test_token',
+    } as Record<string, string>,
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'saved-config-client', version: '1.0.0' });
+
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({ name: 'platform_deploy_static', arguments: {} });
+    assert.equal(result.isError, undefined);
+    const content = result.content[0];
+    assert.equal(content.type, 'text');
+    assert.ok('text' in content);
+    assert.equal(JSON.parse(content.text).site_id, 'site-123');
+  } finally {
+    await client.close();
+  }
+
+  assert.equal(requests.some(({ method, url }) => method === 'POST' && url === '/v1/sites'), false);
+});
+
+test('platform_inspect_project reports real project metadata without creating config', async () => {
+  const project = mkdtempSync(join(TMP, 'inspect-project-'));
+  writeFileSync(join(project, 'package.json'), JSON.stringify({
+    name: '@fixture/inspect-me',
+    scripts: { build: 'vite build' },
+  }));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['--import', TSX_LOADER, CLI],
+    cwd: project,
+    env: { ...process.env, PLATFORM_API_TOKEN: 'shp_test_token' } as Record<string, string>,
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'inspect-client', version: '1.0.0' });
+
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({ name: 'platform_inspect_project', arguments: {} });
+    assert.equal(result.isError, undefined);
+    const content = result.content[0];
+    assert.equal(content.type, 'text');
+    assert.ok('text' in content);
+    assert.deepEqual(JSON.parse(content.text), {
+      configured: false,
+      config_path: join(project, '.shiplo', 'project.json'),
+      project_name: 'inspect-me',
+      preferred_subdomain: 'inspect-me',
+      build_command: 'npm run build',
+      output_dir: 'dist',
+      missing_fields: [],
+      site_id: null,
+      subdomain: null,
+    });
+    assert.equal(existsSync(join(project, '.shiplo')), false);
+  } finally {
+    await client.close();
+  }
+});
+
+test('ambiguous project stops before site creation and identifies the missing field', async () => {
+  requests.length = 0;
+  const project = mkdtempSync(join(TMP, 'ambiguous-project-'));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['--import', TSX_LOADER, CLI],
+    cwd: project,
+    env: {
+      ...process.env,
+      PLATFORM_API_BASE_URL: baseUrl,
+      PLATFORM_API_TOKEN: 'shp_test_token',
+    } as Record<string, string>,
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'ambiguous-client', version: '1.0.0' });
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({ name: 'platform_deploy_static', arguments: {} });
+    assert.equal(result.isError, true);
+    const content = result.content[0];
+    assert.equal(content.type, 'text');
+    assert.ok('text' in content);
+    assert.deepEqual(JSON.parse(content.text), {
+      error: {
+        code: 'PROJECT_CONFIG_REQUIRED',
+        message: 'Shiplo could not safely detect all deployment settings',
+        config_path: join(project, '.shiplo', 'project.json'),
+        missing_fields: ['output_dir'],
+      },
+    });
+  } finally {
+    await client.close();
+  }
+  assert.equal(requests.length, 0);
+  assert.equal(existsSync(join(project, '.shiplo')), false);
+});
+
+test('saved site is verified before its build command runs', async () => {
+  requests.length = 0;
+  const project = mkdtempSync(join(TMP, 'stale-site-'));
+  mkdirSync(join(project, '.shiplo'));
+  writeFileSync(join(project, '.shiplo', 'project.json'), JSON.stringify({
+    version: 1,
+    project_name: 'Stale fixture',
+    site_id: 'stale-site',
+    subdomain: 'stale-fixture',
+    build_command: `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('build-ran.txt', 'yes')"`,
+    output_dir: 'dist',
+  }));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['--import', TSX_LOADER, CLI],
+    cwd: project,
+    env: {
+      ...process.env,
+      PLATFORM_API_BASE_URL: baseUrl,
+      PLATFORM_API_TOKEN: 'shp_test_token',
+    } as Record<string, string>,
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'stale-site-client', version: '1.0.0' });
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({ name: 'platform_deploy_static', arguments: {} });
+    assert.equal(result.isError, true);
+  } finally {
+    await client.close();
+  }
+  assert.equal(existsSync(join(project, 'build-ran.txt')), false);
+  assert.deepEqual(requests.map(({ method, url }) => `${method} ${url}`), [
+    'GET /v1/sites/stale-site',
+  ]);
+});
+
+test('first deployment retries once without preferred subdomain when it is unavailable', async () => {
+  requests.length = 0;
+  const project = mkdtempSync(join(TMP, 'taken-project-'));
+  writeFileSync(join(project, 'package.json'), JSON.stringify({ name: 'taken-project' }));
+  writeFileSync(join(project, 'index.html'), '<h1>Collision fallback</h1>');
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['--import', TSX_LOADER, CLI],
+    cwd: project,
+    env: {
+      ...process.env,
+      PLATFORM_API_BASE_URL: baseUrl,
+      PLATFORM_API_TOKEN: 'shp_test_token',
+    } as Record<string, string>,
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'collision-client', version: '1.0.0' });
+
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({ name: 'platform_deploy_static', arguments: {} });
+    assert.equal(result.isError, undefined);
+  } finally {
+    await client.close();
+  }
+
+  const creates = requests.filter(({ method, url }) => method === 'POST' && url === '/v1/sites');
+  assert.equal(creates.length, 2);
+  assert.equal(JSON.parse(creates[0].body.toString('utf8')).preferred_subdomain, 'taken-project');
+  assert.equal('preferred_subdomain' in JSON.parse(creates[1].body.toString('utf8')), false);
+  assert.equal(
+    JSON.parse(readFileSync(join(project, '.shiplo', 'project.json'), 'utf8')).subdomain,
+    'generated-project-a1b2c3d4e5f6'
+  );
+});
+
 test('platform_deploy_static uploads files and activates the created deployment', async () => {
   requests.length = 0;
   const project = mkdtempSync(join(TMP, 'success-'));
@@ -143,10 +444,10 @@ test('platform_deploy_static uploads files and activates the created deployment'
     stderr: 'pipe',
   });
   const client = new Client({ name: 'deploy-test-client', version: '1.0.0' });
+  const buildCommand = `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('.env.build-token', process.env.PLATFORM_API_TOKEN || '')"`;
 
   try {
     await client.connect(transport);
-    const buildCommand = `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('.env.build-token', process.env.PLATFORM_API_TOKEN || '')"`;
     const result = await client.callTool({
       name: 'platform_deploy_static',
       arguments: { site_id: 'site-123', output_dir: '.', build_command: buildCommand },
@@ -172,10 +473,19 @@ test('platform_deploy_static uploads files and activates the created deployment'
   }
 
   assert.equal(readFileSync(join(project, '.env.build-token'), 'utf8'), '');
+  assert.deepEqual(JSON.parse(readFileSync(join(project, '.shiplo', 'project.json'), 'utf8')), {
+    version: 1,
+    project_name: project.split(/[/\\]/).at(-1),
+    site_id: 'site-123',
+    subdomain: 'fixture',
+    build_command: buildCommand,
+    output_dir: '.',
+  });
 
   assert.deepEqual(
     requests.map(({ method, url }) => `${method} ${url}`),
     [
+      'GET /v1/sites/site-123',
       'GET /v1/sites/site-123',
       'POST /v1/sites/site-123/deployments',
       'PUT /v1/deployments/dep-123/files/assets/app.js',
@@ -198,11 +508,11 @@ test('platform_deploy_static uploads files and activates the created deployment'
     file_count: 2,
     artifact_type: 'static',
   };
-  assert.deepEqual(JSON.parse(requests[1].body.toString('utf8')), { manifest });
-  assert.deepEqual(JSON.parse(requests[4].body.toString('utf8')), { manifest });
-  assert.equal(requests[2].contentType, 'application/octet-stream');
-  assert.deepEqual(requests[2].body, files.get('assets/app.js'));
-  assert.deepEqual(requests[3].body, files.get('index.html'));
+  assert.deepEqual(JSON.parse(requests[2].body.toString('utf8')), { manifest });
+  assert.deepEqual(JSON.parse(requests[5].body.toString('utf8')), { manifest });
+  assert.equal(requests[3].contentType, 'application/octet-stream');
+  assert.deepEqual(requests[3].body, files.get('assets/app.js'));
+  assert.deepEqual(requests[4].body, files.get('index.html'));
 });
 
 test('auto-detected output rejects a symlink that escapes the project', async () => {

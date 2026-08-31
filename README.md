@@ -25,16 +25,23 @@ Shiplo URL. Project-root deployments exclude `.env*`, `.npmrc`, `.git`, and
 and cloud CLI credential directories, so local secrets are not uploaded. The
 Shiplo API token is removed from the environment of any requested build command.
 
+On the first deployment, Shiplo detects the project settings and writes a
+committed `.shiplo/project.json` containing the project name, Shiplo site ID,
+subdomain, build command, and output directory. It never stores the API token.
+Later deployments reuse this file, so a normal "deploy this project" request
+does not need the same setup questions again. Existing projects without the file
+remain compatible: their next deployment creates it automatically.
+
 ## Install
 
 ```bash
-npm install -g @shiplohq/mcp
+npm install -g @shiplohq/mcp@latest
 ```
 
 Or run once with:
 
 ```bash
-npx @shiplohq/mcp
+npx @shiplohq/mcp@latest
 ```
 
 Requires Node.js >= 24.
@@ -51,7 +58,7 @@ The server reads two environment variables:
 ### Claude Code
 
 ```bash
-claude mcp add platform-mcp --env PLATFORM_API_TOKEN=shp_your_token -- npx -y @shiplohq/mcp
+claude mcp add platform-mcp --env PLATFORM_API_TOKEN=shp_your_token -- npx -y @shiplohq/mcp@latest
 ```
 
 ### Claude Desktop — `claude_desktop_config.json`
@@ -61,7 +68,7 @@ claude mcp add platform-mcp --env PLATFORM_API_TOKEN=shp_your_token -- npx -y @s
   "mcpServers": {
     "platform-mcp": {
       "command": "npx",
-      "args": ["-y", "@shiplohq/mcp"],
+      "args": ["-y", "@shiplohq/mcp@latest"],
       "env": {
         "PLATFORM_API_TOKEN": "shp_your_token"
       }
@@ -75,7 +82,7 @@ claude mcp add platform-mcp --env PLATFORM_API_TOKEN=shp_your_token -- npx -y @s
 ```toml
 [mcp_servers.platform-mcp]
 command = "npx"
-args = ["-y", "@shiplohq/mcp"]
+args = ["-y", "@shiplohq/mcp@latest"]
 env = { PLATFORM_API_TOKEN = "shp_your_token" }
 ```
 
@@ -86,7 +93,7 @@ env = { PLATFORM_API_TOKEN = "shp_your_token" }
   "mcpServers": {
     "platform-mcp": {
       "command": "npx",
-      "args": ["-y", "@shiplohq/mcp"],
+      "args": ["-y", "@shiplohq/mcp@latest"],
       "env": {
         "PLATFORM_API_TOKEN": "shp_your_token"
       }
@@ -97,9 +104,17 @@ env = { PLATFORM_API_TOKEN = "shp_your_token" }
 
 ### Any other MCP client
 
-- Command: `npx -y @shiplohq/mcp`
+- Command: `npx -y @shiplohq/mcp@latest`
 - Transport: stdio
 - Env: `PLATFORM_API_TOKEN` (required), `PLATFORM_API_BASE_URL` (optional)
+
+### Upgrading an existing setup
+
+Change a pinned or unqualified package entry to `@shiplohq/mcp@latest`, then
+restart the MCP server or IDE once. You do not need to change website source,
+delete an existing Shiplo site, or create `.shiplo` manually. The next deployment
+backfills `.shiplo/project.json` and keeps using the existing site ID supplied by
+older clients.
 
 ## Media optimization notes
 

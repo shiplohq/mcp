@@ -9,15 +9,33 @@ import { statSync } from 'fs';
 import { isMediaFile } from '@shiplohq/contracts';
 import { optimizeImage, optimizeVideo, VIDEO_EXTENSIONS } from './optimize.js';
 import { deployStatic, serializeDeployError } from './deploy.js';
+import {
+  inspectProject,
+  projectConfigPath,
+  readProjectConfig,
+  writeProjectConfig,
+} from './project-config.js';
 
 const API_BASE_URL = process.env.PLATFORM_API_BASE_URL || 'https://shiplo.site/v1';
 const API_TOKEN = process.env.PLATFORM_API_TOKEN || '';
+
+class ShiploRequestError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string | undefined,
+    message: string,
+    public readonly details: unknown
+  ) {
+    super(message);
+    this.name = 'ShiploRequestError';
+  }
+}
 
 // Create MCP server
 const server = new Server(
   {
     name: 'shiplo-platform-mcp',
-    version: '0.1.2',
+    version: '0.1.3',
   },
   {
     capabilities: {
@@ -40,8 +58,16 @@ async function apiRequest(endpoint: string, options?: RequestInit): Promise<Resp
   });
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ message: response.statusText })) as { error?: { message?: string }; message?: string };
-    throw new Error(errorData.error?.message ?? errorData.message ?? 'API request failed');
+    const errorData = await response.json().catch(() => ({ message: response.statusText })) as {
+      error?: { code?: string; message?: string; details?: unknown };
+      message?: string;
+    };
+    throw new ShiploRequestError(
+      response.status,
+      errorData.error?.code,
+      errorData.error?.message ?? errorData.message ?? 'API request failed',
+      errorData.error?.details
+    );
   }
 
   return response;
@@ -101,7 +127,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'platform_deploy_static',
         description:
-          'Deploy the current project as a static site, running build_command first when provided. Honors plan upload limits ' +
+          'Deploy the current project as a static site. On first use, detects settings and writes .shiplo/project.json; later calls reuse it. ' +
+          'Runs build_command first when configured. Honors plan upload limits ' +
           '(per-file size cap and account-wide file cap — call platform_account_status first ' +
           'to get them); oversized images/videos trigger an interactive optimize-or-skip choice ' +
           'for the user.',
@@ -110,7 +137,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             site_id: {
               type: 'string',
-              description: 'Site ID to deploy to',
+              description: 'Site ID override (optional; uses .shiplo config or creates a site on first deploy)',
             },
             build_command: {
               type: 'string',
@@ -121,7 +148,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: 'Output directory (optional, will auto-detect)',
             },
           },
-          required: ['site_id'],
         },
       },
       {
@@ -227,11 +253,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'platform_inspect_project': {
-        // Project inspection would analyze the current directory
+        const inspection = await inspectProject(process.cwd());
+        const config = await readProjectConfig(process.cwd());
         const result = {
-          detected: 'vite',
-          output_dir: 'dist',
-          build_command: 'npm run build',
+          configured: config !== null,
+          config_path: projectConfigPath(process.cwd()),
+          ...inspection,
+          site_id: config?.site_id ?? null,
+          subdomain: config?.subdomain ?? null,
+          ...(config ? {
+            project_name: config.project_name,
+            build_command: config.build_command,
+            output_dir: config.output_dir,
+          } : {}),
         };
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
@@ -244,23 +278,127 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const buildCommand = args?.build_command;
         const outputDir = args?.output_dir;
 
-        if (!siteId) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: 'Error: site_id is required for deployment',
-              },
-            ],
-            isError: true,
-          };
-        }
-
         try {
+          let resolvedSiteId = typeof siteId === 'string' ? siteId : undefined;
+          let resolvedBuildCommand = typeof buildCommand === 'string' ? buildCommand : undefined;
+          let resolvedOutputDir = typeof outputDir === 'string' ? outputDir : undefined;
+          const savedConfig = await readProjectConfig(process.cwd());
+
+          resolvedSiteId = resolvedSiteId ?? savedConfig?.site_id;
+          resolvedBuildCommand = resolvedBuildCommand ?? savedConfig?.build_command ?? undefined;
+          resolvedOutputDir = resolvedOutputDir ?? savedConfig?.output_dir;
+
+          if (!resolvedSiteId) {
+            const inspection = await inspectProject(process.cwd());
+            resolvedBuildCommand = resolvedBuildCommand ?? inspection.build_command ?? undefined;
+            resolvedOutputDir = resolvedOutputDir ?? inspection.output_dir ?? undefined;
+            if (!resolvedOutputDir) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    error: {
+                      code: 'PROJECT_CONFIG_REQUIRED',
+                      message: 'Shiplo could not safely detect all deployment settings',
+                      config_path: projectConfigPath(process.cwd()),
+                      missing_fields: ['output_dir'],
+                    },
+                  }, null, 2),
+                }],
+                isError: true,
+              };
+            }
+            const createSite = (preferredSubdomain?: string) => apiRequest('/sites', {
+              method: 'POST',
+              body: JSON.stringify({
+                name: inspection.project_name,
+                ...(preferredSubdomain ? { preferred_subdomain: preferredSubdomain } : {}),
+                routing_mode: 'static',
+              }),
+            });
+            let response: Response;
+            try {
+              response = await createSite(inspection.preferred_subdomain);
+            } catch (error) {
+              if (
+                error instanceof ShiploRequestError
+                && error.status === 409
+                && error.code === 'HOSTNAME_NOT_AVAILABLE'
+              ) {
+                response = await createSite();
+              } else {
+                throw error;
+              }
+            }
+            const created = await response.json() as {
+              site?: { id?: string; slug?: string };
+              hostnames?: Array<{ hostname?: string; is_primary?: boolean }>;
+            };
+            if (!created.site?.id) throw new Error('Shiplo API did not return site.id');
+            const hostname = created.hostnames?.find((item) => item.is_primary)?.hostname
+              ?? created.hostnames?.[0]?.hostname;
+            resolvedSiteId = created.site.id;
+            await writeProjectConfig(process.cwd(), {
+              version: 1,
+              project_name: inspection.project_name,
+              site_id: resolvedSiteId,
+              subdomain: created.site.slug ?? hostname?.split('.')[0] ?? inspection.preferred_subdomain,
+              build_command: resolvedBuildCommand ?? null,
+              output_dir: resolvedOutputDir,
+            });
+          } else if (!savedConfig) {
+            const inspection = await inspectProject(process.cwd());
+            const siteResponse = await apiRequest(`/sites/${encodeURIComponent(resolvedSiteId)}`);
+            const siteData = await siteResponse.json() as {
+              site?: { id?: string; name?: string; slug?: string; hostname?: string | null };
+              hostnames?: Array<{ hostname?: string; is_primary?: boolean }>;
+            };
+            const hostname = siteData.site?.hostname
+              ?? siteData.hostnames?.find((item) => item.is_primary)?.hostname
+              ?? siteData.hostnames?.[0]?.hostname;
+            resolvedBuildCommand = resolvedBuildCommand ?? inspection.build_command ?? undefined;
+            resolvedOutputDir = resolvedOutputDir ?? inspection.output_dir ?? undefined;
+            if (!resolvedOutputDir) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    error: {
+                      code: 'PROJECT_CONFIG_REQUIRED',
+                      message: 'Shiplo could not safely detect all deployment settings',
+                      config_path: projectConfigPath(process.cwd()),
+                      missing_fields: ['output_dir'],
+                    },
+                  }, null, 2),
+                }],
+                isError: true,
+              };
+            }
+            await writeProjectConfig(process.cwd(), {
+              version: 1,
+              project_name: inspection.project_name,
+              site_id: resolvedSiteId,
+              subdomain: siteData.site?.slug ?? hostname?.split('.')[0] ?? inspection.preferred_subdomain,
+              build_command: resolvedBuildCommand ?? null,
+              output_dir: resolvedOutputDir,
+            });
+          } else if (
+            (typeof buildCommand === 'string' && buildCommand !== savedConfig.build_command)
+            || (typeof outputDir === 'string' && outputDir !== savedConfig.output_dir)
+            || (typeof siteId === 'string' && siteId !== savedConfig.site_id)
+          ) {
+            await writeProjectConfig(process.cwd(), {
+              ...savedConfig,
+              site_id: resolvedSiteId,
+              build_command: resolvedBuildCommand ?? null,
+              output_dir: resolvedOutputDir ?? savedConfig.output_dir,
+            });
+          }
+
           const result = await deployStatic({
-            siteId: String(siteId),
-            buildCommand: typeof buildCommand === 'string' ? buildCommand : undefined,
-            outputDir: typeof outputDir === 'string' ? outputDir : undefined,
+            siteId: resolvedSiteId,
+            buildCommand: resolvedBuildCommand,
+            outputDir: resolvedOutputDir,
             apiBaseUrl: API_BASE_URL,
             apiToken: API_TOKEN,
           });

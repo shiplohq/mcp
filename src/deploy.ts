@@ -15,6 +15,7 @@ const EXCLUDED_DIRECTORIES = new Set([
   '.gcloud',
   '.claude',
   '.codex',
+  '.shiplo',
   'node_modules',
 ]);
 const EXCLUDED_CREDENTIAL_FILES = new Set([
@@ -248,13 +249,22 @@ export async function deployStatic(options: DeployStaticOptions): Promise<Deploy
   if (!options.siteId) throw new Error('site_id is required for deployment');
   if (!apiToken) throw new Error('PLATFORM_API_TOKEN is required');
 
-  if (options.buildCommand?.trim()) {
+  const buildCommand = options.buildCommand?.trim() || undefined;
+  const prevalidatedOutputRoot = buildCommand
+    ? undefined
+    : await resolveOutputDirectory(cwd, options.outputDir);
+
+  const siteData = await requestJson<{ site: { hostname?: string | null } }>(
+    fetchImpl, apiBaseUrl, apiToken, `/sites/${encodeURIComponent(options.siteId)}`
+  );
+
+  if (buildCommand) {
     const { PLATFORM_API_TOKEN: _platformApiToken, ...buildEnv } = process.env;
     const configuredTimeout = Number(process.env.PLATFORM_BUILD_TIMEOUT_MS ?? 10 * 60 * 1000);
     const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0
       ? configuredTimeout
       : 10 * 60 * 1000;
-    await exec(options.buildCommand, {
+    await exec(buildCommand, {
       cwd,
       env: buildEnv,
       timeout,
@@ -263,7 +273,7 @@ export async function deployStatic(options: DeployStaticOptions): Promise<Deploy
     });
   }
 
-  const outputRoot = await resolveOutputDirectory(cwd, options.outputDir);
+  const outputRoot = prevalidatedOutputRoot ?? await resolveOutputDirectory(cwd, options.outputDir);
   const files = await collectFiles(outputRoot);
   if (files.length === 0) throw new Error('Static output directory contains no deployable files');
 
@@ -274,9 +284,6 @@ export async function deployStatic(options: DeployStaticOptions): Promise<Deploy
     artifact_type: 'static',
   };
 
-  const siteData = await requestJson<{ site: { hostname?: string | null } }>(
-    fetchImpl, apiBaseUrl, apiToken, `/sites/${encodeURIComponent(options.siteId)}`
-  );
   const created = await requestJson<{ deployment?: { id?: string } }>(
     fetchImpl,
     apiBaseUrl,
