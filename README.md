@@ -19,8 +19,12 @@ MCP server for the Shiplo deploy platform. It lets AI clients (Claude Code, Clau
 `platform_deploy_static` runs the optional `build_command`, scans `output_dir`
 (or auto-detects `dist`, `out`, `build`, or a project-root `index.html`), creates
 a SHA-256 manifest, uploads every file, finalizes the release, and activates it.
-It returns JSON containing `deployment_id`, `release_id`, `status`, and the live
-Shiplo URL. Project-root deployments exclude `.env*`, `.npmrc`, `.git`, and
+It then polls the public URL until the edge stops serving the unprovisioned-host
+placeholder (`live: true`, up to ~75 seconds) and only then returns JSON with
+`deployment_id`, `release_id`, `status`, `url`, and `live`. If the wait times
+out, `live` is `false` with a `live_note` — the deploy itself is already active,
+and the URL typically works a few seconds later. Set `PLATFORM_LIVE_WAIT_TIMEOUT_MS=0`
+to skip the wait. Project-root deployments exclude `.env*`, `.npmrc`, `.git`, and
 `node_modules`, plus common credential files such as `.mcp.json`, private keys,
 and cloud CLI credential directories, so local secrets are not uploaded. The
 Shiplo API token is removed from the environment of any requested build command.

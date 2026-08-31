@@ -131,7 +131,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           'Runs build_command first when configured. Honors plan upload limits ' +
           '(per-file size cap and account-wide file cap — call platform_account_status first ' +
           'to get them); oversized images/videos trigger an interactive optimize-or-skip choice ' +
-          'for the user.',
+          'for the user. The tool polls the URL after activation and only returns once the edge ' +
+          'serves the site (`live: true`, up to ~75s); if it times out, `live` is false and the ' +
+          'user should retry the URL in a minute — the deploy itself is already active.',
         inputSchema: {
           type: 'object',
           properties: {

@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { deployStatic } from '../src/deploy';
+import { deployStatic, waitForLive } from '../src/deploy';
 
 const TMP = mkdtempSync(join(tmpdir(), 'shiplo-mcp-deploy-'));
 const CLI = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
@@ -183,6 +183,8 @@ test('first deployment creates project config before building and needs no argum
       ...process.env,
       PLATFORM_API_BASE_URL: baseUrl,
       PLATFORM_API_TOKEN: 'shp_test_token',
+      // Deployed fixtures have no real edge behind them — skip the live-URL wait.
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
     } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -248,6 +250,8 @@ test('later deployment reuses saved project config without creating another site
       ...process.env,
       PLATFORM_API_BASE_URL: baseUrl,
       PLATFORM_API_TOKEN: 'shp_test_token',
+      // Deployed fixtures have no real edge behind them — skip the live-URL wait.
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
     } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -318,6 +322,8 @@ test('ambiguous project stops before site creation and identifies the missing fi
       ...process.env,
       PLATFORM_API_BASE_URL: baseUrl,
       PLATFORM_API_TOKEN: 'shp_test_token',
+      // Deployed fixtures have no real edge behind them — skip the live-URL wait.
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
     } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -364,6 +370,8 @@ test('saved site is verified before its build command runs', async () => {
       ...process.env,
       PLATFORM_API_BASE_URL: baseUrl,
       PLATFORM_API_TOKEN: 'shp_test_token',
+      // Deployed fixtures have no real edge behind them — skip the live-URL wait.
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
     } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -394,6 +402,8 @@ test('first deployment retries once without preferred subdomain when it is unava
       ...process.env,
       PLATFORM_API_BASE_URL: baseUrl,
       PLATFORM_API_TOKEN: 'shp_test_token',
+      // Deployed fixtures have no real edge behind them — skip the live-URL wait.
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
     } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -440,6 +450,8 @@ test('platform_deploy_static uploads files and activates the created deployment'
       ...process.env,
       PLATFORM_API_BASE_URL: baseUrl,
       PLATFORM_API_TOKEN: 'shp_test_token',
+      // Deployed fixtures have no real edge behind them — skip the live-URL wait.
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
     } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -467,6 +479,9 @@ test('platform_deploy_static uploads files and activates the created deployment'
       url: 'https://fixture.shiplo.site',
       file_count: 2,
       total_bytes: 45,
+      live: false,
+      live_wait_ms: 0,
+      live_note: 'live check disabled (PLATFORM_LIVE_WAIT_TIMEOUT_MS=0)',
     });
   } finally {
     await client.close();
@@ -599,6 +614,8 @@ test('platform_deploy_static preserves structured quota error details', async ()
       ...process.env,
       PLATFORM_API_BASE_URL: baseUrl,
       PLATFORM_API_TOKEN: 'shp_test_token',
+      // Deployed fixtures have no real edge behind them — skip the live-URL wait.
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
     } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -642,6 +659,8 @@ test('upload failures include deployment and phase context', async () => {
       ...process.env,
       PLATFORM_API_BASE_URL: baseUrl,
       PLATFORM_API_TOKEN: 'shp_test_token',
+      // Deployed fixtures have no real edge behind them — skip the live-URL wait.
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
     } as Record<string, string>,
     stderr: 'pipe',
   });
@@ -671,5 +690,97 @@ test('upload failures include deployment and phase context', async () => {
     });
   } finally {
     await client.close();
+  }
+});
+
+test('waitForLive resolves once the edge stops serving the placeholder', async () => {
+  let probes = 0;
+  const fetchImpl: typeof fetch = async () => {
+    probes += 1;
+    if (probes === 1) {
+      return new Response('<html>placeholder</html>', {
+        status: 404,
+        headers: { 'x-shiplo-parked': '1' },
+      });
+    }
+    return new Response('<html>real site</html>', { status: 200 });
+  };
+
+  const probe = await waitForLive('fixture.shiplo.site', fetchImpl, 5_000, 1);
+  assert.equal(probe.live, true);
+  assert.equal(probes, 2);
+  assert.equal(probe.note, undefined);
+});
+
+test('waitForLive treats an unmarked 404 (edge predating the marker) as not live', async () => {
+  const fetchImpl: typeof fetch = async () => new Response('<html>placeholder</html>', { status: 404 });
+
+  const probe = await waitForLive('fixture.shiplo.site', fetchImpl, 30, 5);
+  assert.equal(probe.live, false);
+  assert.match(probe.note ?? '', /not verified live/);
+});
+
+test('waitForLive never throws on network errors and reports the last probe state', async () => {
+  const fetchImpl: typeof fetch = async () => {
+    throw new Error('getaddrinfo ENOTFOUND fixture.shiplo.site');
+  };
+
+  const probe = await waitForLive('fixture.shiplo.site', fetchImpl, 30, 5);
+  assert.equal(probe.live, false);
+  assert.match(probe.note ?? '', /ENOTFOUND/);
+});
+
+test('deployStatic holds the URL back until a live probe succeeds', async () => {
+  const project = mkdtempSync(join(TMP, 'live-wait-'));
+  mkdirSync(join(project, 'dist'));
+  writeFileSync(join(project, 'dist', 'index.html'), '<h1>Live wait fixture</h1>');
+  let probes = 0;
+
+  const fetchImpl = (async (input, init) => {
+    const url = new URL(String(input));
+    if (url.host === 'fixture.shiplo.site') {
+      probes += 1;
+      if (probes === 1) {
+        return new Response('<html>placeholder</html>', {
+          status: 404,
+          headers: { 'x-shiplo-parked': '1' },
+        });
+      }
+      return new Response('<html>real site</html>', { status: 200 });
+    }
+    if (init?.method === undefined && url.pathname === '/v1/sites/site-123') {
+      return Response.json({ site: { hostname: 'fixture.shiplo.site' } });
+    }
+    if (init?.method === 'POST' && url.pathname === '/v1/sites/site-123/deployments') {
+      return Response.json({ deployment: { id: 'dep-live' } }, { status: 201 });
+    }
+    if (init?.method === 'PUT') {
+      return Response.json({ uploaded: true });
+    }
+    if (url.pathname.endsWith('/finalize')) {
+      return Response.json({ release: { id: 'rel-live' } });
+    }
+    if (url.pathname.endsWith('/activate')) {
+      return Response.json({ deployment: { status: 'active', release_id: 'rel-live' } });
+    }
+    return Response.json({ error: { message: 'unexpected request' } }, { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    const result = await deployStatic({
+      siteId: 'site-123',
+      cwd: project,
+      apiToken: 'shp_test_token',
+      apiBaseUrl: 'https://api.test/v1',
+      fetchImpl,
+      liveProbeIntervalMs: 1,
+    });
+    assert.equal(result.live, true);
+    assert.equal(probes, 2);
+    assert.equal(result.url, 'https://fixture.shiplo.site');
+    assert.equal(result.live_note, undefined);
+    assert.ok(result.live_wait_ms >= 0);
+  } finally {
+    rmSync(project, { recursive: true, force: true });
   }
 });

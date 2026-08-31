@@ -47,6 +47,10 @@ export type DeployStaticOptions = {
   apiBaseUrl?: string;
   apiToken?: string;
   fetchImpl?: typeof fetch;
+  /** How long to poll the URL for the edge to start serving (0 disables the wait). */
+  liveWaitTimeoutMs?: number;
+  /** Delay between live probes. */
+  liveProbeIntervalMs?: number;
 };
 
 export type DeployStaticResult = {
@@ -58,6 +62,12 @@ export type DeployStaticResult = {
   url: string | null;
   file_count: number;
   total_bytes: number;
+  /** True when a probe of the URL confirmed the site itself is being served. */
+  live: boolean;
+  /** Time spent waiting for the edge (0 when disabled or no hostname). */
+  live_wait_ms: number;
+  /** Why `live` is false — the deploy itself is still committed and active. */
+  live_note?: string;
 };
 
 export class ShiploApiError extends Error {
@@ -222,6 +232,62 @@ function jsonBody(value: unknown): RequestInit {
   };
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+export type LiveProbeResult = { live: boolean; waitMs: number; note?: string };
+
+/**
+ * Activation commits in the platform API before edge reconciliation attaches
+ * the hostname to the web server (a background loop ticks every few seconds —
+ * this gap is why a freshly returned URL could 404/placeholder minutes ago).
+ * Probe the public URL until it stops answering the platform placeholder.
+ *
+ * The placeholder carries the `X-Shiplo-Parked` response header; a 404/5xx
+ * also counts as not-yet-live for edges that predate the header. A timeout is
+ * NOT a deploy failure — the release is active and the edge applies routing on
+ * its own — so callers report the URL with `live: false` and a note.
+ */
+export async function waitForLive(
+  hostname: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+  intervalMs: number
+): Promise<LiveProbeResult> {
+  const startedAt = Date.now();
+  if (timeoutMs <= 0) {
+    return { live: false, waitMs: 0, note: 'live check disabled (PLATFORM_LIVE_WAIT_TIMEOUT_MS=0)' };
+  }
+  const deadline = startedAt + timeoutMs;
+  let lastState = 'unreachable';
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const response = await fetchImpl(`https://${hostname}/?_shiplo_live_probe=${attempt}`, {
+        // Unique query per attempt keeps any cache out of the way; no-store
+        // is implied by the URL being new every probe.
+        redirect: 'follow',
+        signal: AbortSignal.timeout(10_000),
+      });
+      const parked = (response.headers.get('x-shiplo-parked') ?? '') === '1';
+      const status = response.status;
+      if (!parked && status >= 200 && status < 400) {
+        return { live: true, waitMs: Date.now() - startedAt };
+      }
+      lastState = parked ? `placeholder (HTTP ${status})` : `HTTP ${status}`;
+    } catch (error) {
+      lastState = error instanceof Error ? error.message : String(error);
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(Math.min(intervalMs, Math.max(1, deadline - Date.now())));
+  }
+  return {
+    live: false,
+    waitMs: Date.now() - startedAt,
+    note:
+      `URL not verified live within ${timeoutMs}ms (last probe: ${lastState}). ` +
+      'The deploy is active — edge routing applies on the next reconcile tick, so the URL should work shortly.',
+  };
+}
+
 function encodeFilePath(path: string): string {
   return path.split('/').map(encodeURIComponent).join('/');
 }
@@ -348,6 +414,24 @@ export async function deployStatic(options: DeployStaticOptions): Promise<Deploy
   }
 
   const hostname = siteData.site.hostname ?? null;
+
+  // Hold the URL back until the edge actually serves the site — returning it
+  // the moment activation commits is what made fresh URLs 404/placeholder.
+  const liveWaitTimeoutMs = resolveLiveConfig(
+    options.liveWaitTimeoutMs,
+    process.env.PLATFORM_LIVE_WAIT_TIMEOUT_MS,
+    75_000
+  );
+  const liveProbeIntervalMs = resolveLiveConfig(
+    options.liveProbeIntervalMs,
+    process.env.PLATFORM_LIVE_PROBE_INTERVAL_MS,
+    2_000
+  );
+  let liveProbe: LiveProbeResult = { live: false, waitMs: 0, note: 'site has no hostname attached' };
+  if (hostname) {
+    liveProbe = await waitForLive(hostname, fetchImpl, liveWaitTimeoutMs, liveProbeIntervalMs);
+  }
+
   return {
     deployment_id: deploymentId,
     release_id: activated.deployment.release_id ?? releaseId,
@@ -357,5 +441,16 @@ export async function deployStatic(options: DeployStaticOptions): Promise<Deploy
     url: hostname ? `https://${hostname}` : null,
     file_count: manifest.file_count,
     total_bytes: manifest.total_bytes,
+    live: liveProbe.live,
+    live_wait_ms: liveProbe.waitMs,
+    ...(liveProbe.note ? { live_note: liveProbe.note } : {}),
   };
+}
+
+/** First non-negative finite number wins: option, then env, then default. */
+function resolveLiveConfig(optionValue: number | undefined, envValue: string | undefined, fallback: number): number {
+  for (const candidate of [optionValue, envValue === undefined ? undefined : Number(envValue)]) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) return candidate;
+  }
+  return fallback;
 }
