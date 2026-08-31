@@ -16,6 +16,15 @@ MCP server for the Shiplo deploy platform. It lets AI clients (Claude Code, Clau
 | `platform_deployment_events` | Get lifecycle events for a deployment |
 | `platform_delete_site` | Delete a site |
 
+`platform_deploy_static` runs the optional `build_command`, scans `output_dir`
+(or auto-detects `dist`, `out`, `build`, or a project-root `index.html`), creates
+a SHA-256 manifest, uploads every file, finalizes the release, and activates it.
+It returns JSON containing `deployment_id`, `release_id`, `status`, and the live
+Shiplo URL. Project-root deployments exclude `.env*`, `.npmrc`, `.git`, and
+`node_modules`, plus common credential files such as `.mcp.json`, private keys,
+and cloud CLI credential directories, so local secrets are not uploaded. The
+Shiplo API token is removed from the environment of any requested build command.
+
 ## Install
 
 ```bash

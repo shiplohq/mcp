@@ -1,11 +1,11 @@
 {
   "name": "@shiplohq/mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server for the Shiplo deploy platform — deploy and manage static sites from your AI client",
   "license": "MIT",
   "main": "./dist/index.js",
   "bin": {
-    "platform-mcp": "./dist/cli.js"
+    "platform-mcp": "dist/cli.js"
   },
   "files": [
     "dist"
