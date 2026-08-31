@@ -1,13 +1,21 @@
 {
-  "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "composite": true,
+    "target": "ES2024",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "lib": ["ES2024"],
+    "strict": true,
+    "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
-    "esModuleInterop": true
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": "./src"
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
 }
