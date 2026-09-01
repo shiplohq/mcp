@@ -7,10 +7,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import sharp from 'sharp';
-import { optimizeImage, optimizeVideo, findFfmpeg } from '../src/optimize';
+import { optimizeImage, optimizeVideo, findFfmpeg, isAbsoluteMediaPath } from '../src/optimize';
 
 const TMP = mkdtempSync(join(tmpdir(), 'shiplo-mcp-opt-'));
 const MB = 1024 * 1024;
+
+test('media path validation accepts the native absolute-path format', () => {
+  assert.equal(isAbsoluteMediaPath(join(TMP, 'native.png')), true);
+  assert.equal(isAbsoluteMediaPath('relative/native.png'), false);
+});
 
 after(async () => {
   rmSync(TMP, { recursive: true, force: true });

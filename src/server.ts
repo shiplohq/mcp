@@ -4,20 +4,31 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { z } from 'zod';
 import { statSync } from 'fs';
 import { isMediaFile } from '@shiplohq/contracts';
-import { optimizeImage, optimizeVideo, VIDEO_EXTENSIONS } from './optimize.js';
-import { deployStatic, serializeDeployError } from './deploy.js';
+import { isAbsoluteMediaPath, optimizeImage, optimizeVideo, VIDEO_EXTENSIONS } from './optimize.js';
+import {
+  deployStatic, disposePreparedStaticDeployment, prepareStaticDeployment, serializeDeployError,
+} from './deploy.js';
 import {
   inspectProject,
   projectConfigPath,
   readProjectConfig,
+  type ShiploProjectConfig,
   writeProjectConfig,
 } from './project-config.js';
 
 const API_BASE_URL = process.env.PLATFORM_API_BASE_URL || 'https://shiplo.site/v1';
 const API_TOKEN = process.env.PLATFORM_API_TOKEN || '';
+const OBJECT_OUTPUT_SCHEMA = { type: 'object' as const, additionalProperties: true };
+
+function toolResult(data: Record<string, unknown>, isError = false) {
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+    structuredContent: data,
+    ...(isError ? { isError: true } : {}),
+  };
+}
 
 class ShiploRequestError extends Error {
   constructor(
@@ -35,7 +46,7 @@ class ShiploRequestError extends Error {
 const server = new Server(
   {
     name: 'shiplo-platform-mcp',
-    version: '0.1.4',
+    version: '0.1.6',
   },
   {
     capabilities: {
@@ -73,6 +84,28 @@ async function apiRequest(endpoint: string, options?: RequestInit): Promise<Resp
   return response;
 }
 
+async function resolveSiteReference(reference: string): Promise<string> {
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(reference)) {
+    return reference;
+  }
+  const response = await apiRequest('/sites');
+  const data = await response.json() as {
+    sites?: Array<{ id?: string; slug?: string; hostname?: string | null }>;
+  };
+  const normalized = reference.toLowerCase();
+  const matches = (data.sites ?? []).filter((site) =>
+    site.slug?.toLowerCase() === normalized
+    || site.hostname?.toLowerCase() === normalized
+    || site.hostname?.toLowerCase() === `${normalized}.shiplo.site`
+  );
+  if (matches.length !== 1 || !matches[0].id) {
+    throw new Error(matches.length > 1
+      ? `Site reference is ambiguous: ${reference}`
+      : `Site not found by ID, slug, or hostname: ${reference}`);
+  }
+  return matches[0].id;
+}
+
 // Tool definitions
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -80,6 +113,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'platform_account_status',
         description: 'Get account status, plan, and usage information',
+        outputSchema: OBJECT_OUTPUT_SCHEMA,
         inputSchema: {
           type: 'object',
           properties: {},
@@ -88,6 +122,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'platform_list_sites',
         description: 'List all sites for the authenticated account',
+        outputSchema: OBJECT_OUTPUT_SCHEMA,
         inputSchema: {
           type: 'object',
           properties: {},
@@ -96,6 +131,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'platform_create_site',
         description: 'Create a new static site with a platform hostname',
+        outputSchema: OBJECT_OUTPUT_SCHEMA,
         inputSchema: {
           type: 'object',
           properties: {
@@ -107,11 +143,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'string',
               description: 'Preferred subdomain (optional)',
             },
-            routing_mode: {
-              type: 'string',
-              enum: ['static', 'spa'],
-              description: 'Routing mode (default: static)',
-            },
           },
           required: ['name'],
         },
@@ -119,6 +150,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'platform_inspect_project',
         description: 'Inspect the current project to detect build configuration',
+        outputSchema: OBJECT_OUTPUT_SCHEMA,
         inputSchema: {
           type: 'object',
           properties: {},
@@ -130,16 +162,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           'Deploy the current project as a static site. On first use, detects settings and writes .shiplo/project.json; later calls reuse it. ' +
           'Runs build_command first when configured. Honors plan upload limits ' +
           '(per-file size cap and account-wide file cap — call platform_account_status first ' +
-          'to get them); oversized images/videos trigger an interactive optimize-or-skip choice ' +
-          'for the user. The tool polls the URL after activation and only returns once the edge ' +
+          'to get them); set oversized explicitly to optimize or skip files over the plan cap. ' +
+          'The tool polls the URL after activation and only returns once the edge ' +
           'serves the site (`live: true`, up to ~75s); if it times out, `live` is false and the ' +
           'user should retry the URL in a minute — the deploy itself is already active.',
+        outputSchema: OBJECT_OUTPUT_SCHEMA,
         inputSchema: {
           type: 'object',
           properties: {
             site_id: {
               type: 'string',
-              description: 'Site ID override (optional; uses .shiplo config or creates a site on first deploy)',
+              description: 'Site UUID override (optional; uses .shiplo config or creates a site on first deploy)',
+            },
+            site_slug: {
+              type: 'string',
+              description: 'Site slug or hostname override; avoids a separate list-sites call',
             },
             build_command: {
               type: 'string',
@@ -149,6 +186,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'string',
               description: 'Output directory (optional, will auto-detect)',
             },
+            resume_deployment_id: {
+              type: 'string',
+              description: 'Resume an interrupted created/uploading deployment',
+            },
+            oversized: {
+              type: 'string',
+              enum: ['optimize', 'skip', 'error'],
+              description: 'Policy for files over the plan cap (default: error)',
+            },
           },
         },
       },
@@ -156,9 +202,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: 'platform_optimize_media',
         description:
           'Shrink an oversized local image or video file to fit a byte cap, in place ' +
-          '(images re-encode via sharp; videos via ffmpeg — available in the full MCP ' +
-          'build or when ffmpeg is on PATH). Call this after the user chose "optimize" ' +
-          'over "skip" for a file exceeding plan.max_file_size_bytes.',
+          '(images re-encode via sharp; videos require ffmpeg on PATH). ' +
+          'This tool always performs the requested optimization.',
+        outputSchema: OBJECT_OUTPUT_SCHEMA,
         inputSchema: {
           type: 'object',
           properties: {
@@ -178,20 +224,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'platform_deployment_status',
         description: 'Get the status of a deployment',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            deployment_id: {
-              type: 'string',
-              description: 'Deployment ID',
-            },
-          },
-          required: ['deployment_id'],
-        },
-      },
-      {
-        name: 'platform_deployment_events',
-        description: 'Get events for a deployment',
+        outputSchema: OBJECT_OUTPUT_SCHEMA,
         inputSchema: {
           type: 'object',
           properties: {
@@ -206,6 +239,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'platform_delete_site',
         description: 'Delete a site',
+        outputSchema: OBJECT_OUTPUT_SCHEMA,
         inputSchema: {
           type: 'object',
           properties: {
@@ -222,7 +256,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // Tool implementations
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
 
   try {
@@ -230,28 +264,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'platform_account_status': {
         const response = await apiRequest('/account');
         const data = await response.json();
-        return {
-          content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
-        };
+        return toolResult(data as Record<string, unknown>);
       }
 
       case 'platform_list_sites': {
         const response = await apiRequest('/sites');
         const data = await response.json();
-        return {
-          content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
-        };
+        return toolResult(data as Record<string, unknown>);
       }
 
       case 'platform_create_site': {
         const response = await apiRequest('/sites', {
           method: 'POST',
-          body: JSON.stringify(args),
+          body: JSON.stringify({
+            name: args?.name,
+            ...(typeof args?.preferred_subdomain === 'string'
+              ? { preferred_subdomain: args.preferred_subdomain }
+              : {}),
+          }),
         });
         const data = await response.json();
-        return {
-          content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
-        };
+        return toolResult(data as Record<string, unknown>);
       }
 
       case 'platform_inspect_project': {
@@ -269,22 +302,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             output_dir: config.output_dir,
           } : {}),
         };
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        };
+        return toolResult(result);
       }
 
       case 'platform_deploy_static': {
         // Full deployment implementation
         const siteId = args?.site_id;
+        const siteSlug = args?.site_slug;
         const buildCommand = args?.build_command;
         const outputDir = args?.output_dir;
+        const resumeDeploymentId = args?.resume_deployment_id;
+        const oversized = args?.oversized;
+        let createdSiteConfig: ShiploProjectConfig | undefined;
+        let prepared: Awaited<ReturnType<typeof prepareStaticDeployment>> | undefined;
 
         try {
-          let resolvedSiteId = typeof siteId === 'string' ? siteId : undefined;
+          let resolvedSiteId = typeof siteId === 'string'
+            ? siteId
+            : typeof siteSlug === 'string'
+              ? await resolveSiteReference(siteSlug)
+              : undefined;
           let resolvedBuildCommand = typeof buildCommand === 'string' ? buildCommand : undefined;
           let resolvedOutputDir = typeof outputDir === 'string' ? outputDir : undefined;
           const savedConfig = await readProjectConfig(process.cwd());
+          let nextConfig: ShiploProjectConfig | undefined;
+
+          const progressToken = request.params._meta?.progressToken;
+          const onProgress = progressToken === undefined ? undefined : async (update: {
+            completed: number; total: number; message: string;
+          }) => {
+            await extra.sendNotification({
+              method: 'notifications/progress',
+              params: {
+                progressToken,
+                progress: update.completed,
+                total: update.total,
+                message: update.message,
+              },
+            });
+          };
 
           resolvedSiteId = resolvedSiteId ?? savedConfig?.site_id;
           resolvedBuildCommand = resolvedBuildCommand ?? savedConfig?.build_command ?? undefined;
@@ -295,21 +351,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             resolvedBuildCommand = resolvedBuildCommand ?? inspection.build_command ?? undefined;
             resolvedOutputDir = resolvedOutputDir ?? inspection.output_dir ?? undefined;
             if (!resolvedOutputDir) {
-              return {
-                content: [{
-                  type: 'text',
-                  text: JSON.stringify({
-                    error: {
-                      code: 'PROJECT_CONFIG_REQUIRED',
-                      message: 'Shiplo could not safely detect all deployment settings',
-                      config_path: projectConfigPath(process.cwd()),
-                      missing_fields: ['output_dir'],
-                    },
-                  }, null, 2),
-                }],
-                isError: true,
-              };
+              return toolResult({ error: {
+                code: 'PROJECT_CONFIG_REQUIRED',
+                message: 'Shiplo could not safely detect all deployment settings',
+                config_path: projectConfigPath(process.cwd()),
+                missing_fields: ['output_dir'],
+              } }, true);
             }
+            prepared = await prepareStaticDeployment({
+              cwd: process.cwd(), buildCommand: resolvedBuildCommand, outputDir: resolvedOutputDir,
+              apiBaseUrl: API_BASE_URL, apiToken: API_TOKEN,
+              oversized: oversized === 'optimize' || oversized === 'skip' || oversized === 'error' ? oversized : undefined,
+              signal: extra.signal, onProgress,
+            });
             const createSite = (preferredSubdomain?: string) => apiRequest('/sites', {
               method: 'POST',
               body: JSON.stringify({
@@ -340,14 +394,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const hostname = created.hostnames?.find((item) => item.is_primary)?.hostname
               ?? created.hostnames?.[0]?.hostname;
             resolvedSiteId = created.site.id;
-            await writeProjectConfig(process.cwd(), {
+            nextConfig = {
               version: 1,
               project_name: inspection.project_name,
               site_id: resolvedSiteId,
               subdomain: created.site.slug ?? hostname?.split('.')[0] ?? inspection.preferred_subdomain,
               build_command: resolvedBuildCommand ?? null,
               output_dir: resolvedOutputDir,
-            });
+            };
+            createdSiteConfig = nextConfig;
           } else if (!savedConfig) {
             const inspection = await inspectProject(process.cwd());
             const siteResponse = await apiRequest(`/sites/${encodeURIComponent(resolvedSiteId)}`);
@@ -361,40 +416,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             resolvedBuildCommand = resolvedBuildCommand ?? inspection.build_command ?? undefined;
             resolvedOutputDir = resolvedOutputDir ?? inspection.output_dir ?? undefined;
             if (!resolvedOutputDir) {
-              return {
-                content: [{
-                  type: 'text',
-                  text: JSON.stringify({
-                    error: {
-                      code: 'PROJECT_CONFIG_REQUIRED',
-                      message: 'Shiplo could not safely detect all deployment settings',
-                      config_path: projectConfigPath(process.cwd()),
-                      missing_fields: ['output_dir'],
-                    },
-                  }, null, 2),
-                }],
-                isError: true,
-              };
+              return toolResult({ error: {
+                code: 'PROJECT_CONFIG_REQUIRED',
+                message: 'Shiplo could not safely detect all deployment settings',
+                config_path: projectConfigPath(process.cwd()),
+                missing_fields: ['output_dir'],
+              } }, true);
             }
-            await writeProjectConfig(process.cwd(), {
+            nextConfig = {
               version: 1,
               project_name: inspection.project_name,
               site_id: resolvedSiteId,
               subdomain: siteData.site?.slug ?? hostname?.split('.')[0] ?? inspection.preferred_subdomain,
               build_command: resolvedBuildCommand ?? null,
               output_dir: resolvedOutputDir,
-            });
+            };
           } else if (
             (typeof buildCommand === 'string' && buildCommand !== savedConfig.build_command)
             || (typeof outputDir === 'string' && outputDir !== savedConfig.output_dir)
             || (typeof siteId === 'string' && siteId !== savedConfig.site_id)
+            || typeof siteSlug === 'string'
           ) {
-            await writeProjectConfig(process.cwd(), {
+            nextConfig = {
               ...savedConfig,
               site_id: resolvedSiteId,
               build_command: resolvedBuildCommand ?? null,
               output_dir: resolvedOutputDir ?? savedConfig.output_dir,
-            });
+            };
           }
 
           const result = await deployStatic({
@@ -403,15 +451,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             outputDir: resolvedOutputDir,
             apiBaseUrl: API_BASE_URL,
             apiToken: API_TOKEN,
+            resumeDeploymentId: typeof resumeDeploymentId === 'string' ? resumeDeploymentId : undefined,
+            oversized: oversized === 'optimize' || oversized === 'skip' || oversized === 'error' ? oversized : undefined,
+            prepared,
+            signal: extra.signal,
+            onProgress,
           });
-          return {
-            content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-          };
+          if (nextConfig) await writeProjectConfig(process.cwd(), nextConfig);
+          return toolResult(result as unknown as Record<string, unknown>);
         } catch (error) {
-          return {
-            content: [{ type: 'text', text: JSON.stringify(serializeDeployError(error), null, 2) }],
-            isError: true,
-          };
+          await disposePreparedStaticDeployment(prepared);
+          if (createdSiteConfig) {
+            try {
+              await writeProjectConfig(process.cwd(), createdSiteConfig);
+            } catch {
+              // Preserve the deployment error. The serialized deployment id still
+              // lets the caller resume even if local config persistence also fails.
+            }
+          }
+          return toolResult(serializeDeployError(error), true);
         }
       }
 
@@ -419,37 +477,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const filePath = args?.path;
         const maxBytes = args?.max_bytes;
 
-        if (typeof filePath !== 'string' || !filePath.startsWith('/')) {
-          return {
-            content: [{ type: 'text', text: 'Error: path must be an absolute file path' }],
-            isError: true,
-          };
+        if (typeof filePath !== 'string' || !isAbsoluteMediaPath(filePath)) {
+          return toolResult({ error: { message: 'path must be an absolute file path' } }, true);
         }
         if (typeof maxBytes !== 'number' || maxBytes < 1) {
-          return {
-            content: [{ type: 'text', text: 'Error: max_bytes must be a positive integer' }],
-            isError: true,
-          };
+          return toolResult({ error: { message: 'max_bytes must be a positive integer' } }, true);
         }
         let size: number;
         try {
           size = statSync(filePath).size;
         } catch {
-          return {
-            content: [{ type: 'text', text: `Error: file not found: ${filePath}` }],
-            isError: true,
-          };
+          return toolResult({ error: { message: `file not found: ${filePath}` } }, true);
         }
         if (!isMediaFile(filePath)) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Error: not a media file (checked extension). Offer the user skip: ${filePath}`,
-              },
-            ],
-            isError: true,
-          };
+          return toolResult({ error: { message: `not a media file (checked extension): ${filePath}` } }, true);
         }
 
         const result = VIDEO_EXTENSIONS.some((ext) =>
@@ -457,50 +498,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         )
           ? await optimizeVideo(filePath, maxBytes)
           : await optimizeImage(filePath, maxBytes);
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-          isError: !result.ok,
-        };
+        return toolResult(result as unknown as Record<string, unknown>, !result.ok);
       }
 
       case 'platform_deployment_status': {
         const response = await apiRequest(`/deployments/${args?.deployment_id}`);
         const data = await response.json();
-        return {
-          content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
-        };
-      }
-
-      case 'platform_deployment_events': {
-        const response = await apiRequest(`/deployments/${args?.deployment_id}/events`);
-        const data = await response.json();
-        return {
-          content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
-        };
+        return toolResult(data as Record<string, unknown>);
       }
 
       case 'platform_delete_site': {
-        const response = await apiRequest(`/sites/${args?.site_id}`, {
+        const reference = args?.site_id;
+        if (typeof reference !== 'string') return toolResult({ error: { message: 'site_id is required' } }, true);
+        const resolvedSiteId = await resolveSiteReference(reference);
+        await apiRequest(`/sites/${resolvedSiteId}`, {
           method: 'DELETE',
         });
-        return {
-          content: [{ type: 'text', text: 'Site deleted successfully' }],
-        };
+        return toolResult({ deleted: true, site_id: resolvedSiteId });
       }
 
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-        },
-      ],
-      isError: true,
-    };
+    return toolResult({ error: { message: error instanceof Error ? error.message : String(error) } }, true);
   }
 });
 

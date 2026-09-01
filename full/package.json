@@ -10,7 +10,7 @@
     "bin"
   ],
   "dependencies": {
-    "@shiplohq/mcp": "^0.1.4",
+    "@shiplohq/mcp": "0.1.6",
     "ffmpeg-static": "^5.2.0"
   },
   "engines": {

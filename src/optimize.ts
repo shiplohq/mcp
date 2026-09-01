@@ -4,7 +4,7 @@
 // when neither exists the caller offers skip as the only option.
 import { execFile, execFileSync } from 'child_process';
 import { existsSync, promises as fs, renameSync, statSync, unlinkSync } from 'fs';
-import { basename, dirname, extname, join } from 'path';
+import { basename, dirname, extname, isAbsolute, join } from 'path';
 import sharp from 'sharp';
 
 export interface OptimizeResult {
@@ -72,6 +72,10 @@ const GIF_LADDER: ImageAttempt[] = [
 const UNSUPPORTED_IMAGE = new Set(['.svg', '.ico', '.bmp']);
 
 let ffmpegCache: string | null | undefined;
+
+export function isAbsoluteMediaPath(filePath: string): boolean {
+  return isAbsolute(filePath);
+}
 
 /**
  * Locate an ffmpeg binary: ffmpeg-static (full MCP build) first, then PATH.
@@ -161,7 +165,15 @@ export async function optimizeImage(filePath: string, maxBytes: number): Promise
   }
 
   try {
-    for (const attempt of ladder) {
+    const metadata = await sharp(filePath).metadata();
+    const sourceWidth = metadata.width ?? ladder[0].width;
+    const estimatedWidth = Math.max(
+      ladder.at(-1)?.width ?? 1,
+      Math.floor(sourceWidth * Math.sqrt(maxBytes / original) * 1.15)
+    );
+    const firstUseful = ladder.findIndex((attempt) => attempt.width <= estimatedWidth);
+    const attempts = firstUseful > 0 ? ladder.slice(firstUseful) : ladder;
+    for (const attempt of attempts) {
       const buffer = await encodeImage(sharp(filePath), ext, attempt).toBuffer();
       if (buffer.length <= maxBytes) {
         const tmp = `${filePath}.__optimizing${ext}`;
@@ -247,7 +259,7 @@ export async function optimizeVideo(filePath: string, maxBytes: number): Promise
   if (!binary) {
     return {
       ...base,
-      error: 'no ffmpeg available — install the full MCP (platform-mcp-full) or offer the user skip',
+      error: 'no ffmpeg available — install ffmpeg on PATH or skip this video',
     };
   }
 

@@ -1,6 +1,6 @@
 {
   "name": "@shiplohq/mcp",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "MCP server for the Shiplo deploy platform — deploy and manage static sites from your AI client",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -18,10 +18,9 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@shiplohq/contracts": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "sharp": "^0.34.5",
-    "zod": "^4.4.3"
+    "@shiplohq/contracts": "^0.1.0",
+    "sharp": "^0.35.4"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -10,7 +10,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { deployStatic, waitForLive } from '../src/deploy';
+import sharp from 'sharp';
+import { deployStatic, prepareStaticDeployment, waitForLive } from '../src/deploy';
 
 const TMP = mkdtempSync(join(tmpdir(), 'shiplo-mcp-deploy-'));
 const CLI = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
@@ -49,6 +50,12 @@ const api = createServer(async (request: IncomingMessage, response: ServerRespon
     if (input.preferred_subdomain === 'taken-project') {
       return json(response, 409, {
         error: { code: 'HOSTNAME_NOT_AVAILABLE', message: 'Hostname is not available' },
+      });
+    }
+    if (input.name === 'auto-fail-project') {
+      return json(response, 201, {
+        site: { id: 'auto-fail-site', name: input.name, slug: 'auto-fail-project', status: 'active' },
+        hostnames: [{ hostname: 'auto-fail-project.shiplo.site', is_primary: true }],
       });
     }
     const slug = input.preferred_subdomain ?? 'generated-project-a1b2c3d4e5f6';
@@ -91,6 +98,22 @@ const api = createServer(async (request: IncomingMessage, response: ServerRespon
   if (request.method === 'GET' && request.url === '/v1/sites/site-123') {
     return json(response, 200, {
       site: { id: 'site-123', name: 'Fixture site', hostname: 'fixture.shiplo.site' },
+    });
+  }
+  if (request.method === 'GET' && request.url === '/v1/sites/auto-fail-site') {
+    return json(response, 200, {
+      site: { id: 'auto-fail-site', name: 'auto-fail-project', slug: 'auto-fail-project', hostname: null },
+    });
+  }
+  if (request.method === 'POST' && request.url === '/v1/sites/auto-fail-site/deployments') {
+    return json(response, 201, { deployment: { id: 'dep-auto-fail' } });
+  }
+  if (request.method === 'PUT' && request.url?.startsWith('/v1/deployments/dep-auto-fail/files/')) {
+    return json(response, 500, { error: { code: 'UPLOAD_FAILED', message: 'fixture upload failure' } });
+  }
+  if (request.method === 'GET' && request.url === '/v1/sites') {
+    return json(response, 200, {
+      sites: [{ id: 'site-123', slug: 'fixture-site', hostname: 'fixture.shiplo.site' }],
     });
   }
   if (request.method === 'GET' && request.url === '/v1/sites/quota-site') {
@@ -160,7 +183,7 @@ after(async () => {
   rmSync(TMP, { recursive: true, force: true });
 });
 
-test('first deployment creates project config before building and needs no arguments', async () => {
+test('first deployment builds before creating project config and needs no arguments', async () => {
   requests.length = 0;
   const project = mkdtempSync(join(TMP, 'first-deploy-'));
   writeFileSync(join(project, 'package.json'), JSON.stringify({
@@ -170,7 +193,7 @@ test('first deployment creates project config before building and needs no argum
   }));
   writeFileSync(join(project, 'build.mjs'), [
     "import { existsSync, mkdirSync, writeFileSync } from 'node:fs';",
-    "if (!existsSync('.shiplo/project.json')) throw new Error('Shiplo config missing before build');",
+    "if (existsSync('.shiplo/project.json')) throw new Error('Shiplo config must not exist before build');",
     "mkdirSync('dist', { recursive: true });",
     "writeFileSync('dist/index.html', '<h1>First deploy</h1>');",
   ].join('\n'));
@@ -270,6 +293,39 @@ test('later deployment reuses saved project config without creating another site
   }
 
   assert.equal(requests.some(({ method, url }) => method === 'POST' && url === '/v1/sites'), false);
+});
+
+test('a failed first upload saves the created site so retry does not create an orphan duplicate', async () => {
+  requests.length = 0;
+  const project = mkdtempSync(join(TMP, 'auto-fail-project-'));
+  writeFileSync(join(project, 'package.json'), JSON.stringify({ name: 'auto-fail-project' }));
+  writeFileSync(join(project, 'index.html'), '<h1>retry me</h1>');
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['--import', TSX_LOADER, CLI],
+    cwd: project,
+    env: {
+      ...process.env,
+      PLATFORM_API_BASE_URL: baseUrl,
+      PLATFORM_API_TOKEN: 'shp_test_token',
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
+    } as Record<string, string>,
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'auto-fail-client', version: '1.0.0' });
+
+  try {
+    await client.connect(transport);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await client.callTool({ name: 'platform_deploy_static', arguments: {} });
+      assert.equal(result.isError, true);
+    }
+  } finally {
+    await client.close();
+  }
+
+  assert.equal(JSON.parse(readFileSync(join(project, '.shiplo', 'project.json'), 'utf8')).site_id, 'auto-fail-site');
+  assert.equal(requests.filter(({ method, url }) => method === 'POST' && url === '/v1/sites').length, 1);
 });
 
 test('platform_inspect_project reports real project metadata without creating config', async () => {
@@ -482,7 +538,11 @@ test('platform_deploy_static uploads files and activates the created deployment'
       live: false,
       live_wait_ms: 0,
       live_note: 'live check disabled (PLATFORM_LIVE_WAIT_TIMEOUT_MS=0)',
+      skipped_files: [],
+      optimized_files: [],
+      resumed: false,
     });
+    assert.deepEqual(result.structuredContent, JSON.parse(content.text));
   } finally {
     await client.close();
   }
@@ -528,6 +588,37 @@ test('platform_deploy_static uploads files and activates the created deployment'
   assert.equal(requests[3].contentType, 'application/octet-stream');
   assert.deepEqual(requests[3].body, files.get('assets/app.js'));
   assert.deepEqual(requests[4].body, files.get('index.html'));
+});
+
+test('platform_deploy_static resolves a site slug and returns structured output', async () => {
+  requests.length = 0;
+  const project = mkdtempSync(join(TMP, 'slug-deploy-'));
+  writeFileSync(join(project, 'index.html'), '<h1>Slug deploy</h1>');
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['--import', TSX_LOADER, CLI],
+    cwd: project,
+    env: {
+      ...process.env,
+      PLATFORM_API_BASE_URL: baseUrl,
+      PLATFORM_API_TOKEN: 'shp_test_token',
+      PLATFORM_LIVE_WAIT_TIMEOUT_MS: '0',
+    } as Record<string, string>,
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'slug-test-client', version: '1.0.0' });
+  try {
+    await client.connect(transport);
+    const result = await client.callTool({
+      name: 'platform_deploy_static',
+      arguments: { site_slug: 'fixture-site', output_dir: '.' },
+    });
+    assert.equal(result.isError, undefined);
+    assert.equal(result.structuredContent?.site_id, 'site-123');
+    assert.ok(requests.some((request) => request.method === 'GET' && request.url === '/v1/sites'));
+  } finally {
+    await client.close();
+  }
 });
 
 test('auto-detected output rejects a symlink that escapes the project', async () => {
@@ -693,6 +784,151 @@ test('upload failures include deployment and phase context', async () => {
   }
 });
 
+test('deployStatic applies the explicit oversized skip policy before creating a deployment', async () => {
+  const project = mkdtempSync(join(tmpdir(), 'shiplo-mcp-skip-'));
+  writeFileSync(join(project, 'index.html'), 'small');
+  writeFileSync(join(project, 'large.bin'), 'x'.repeat(20));
+  let createdManifest: { files: Array<{ path: string }> } | undefined;
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (!init?.method && url.pathname === '/v1/account') {
+      return Response.json({ plan: { max_file_size_bytes: 10 } });
+    }
+    if (!init?.method && url.pathname === '/v1/sites/site-123') {
+      return Response.json({ site: { hostname: 'fixture.shiplo.site' } });
+    }
+    if (init?.method === 'POST' && url.pathname.endsWith('/deployments')) {
+      createdManifest = JSON.parse(String(init.body)).manifest;
+      return Response.json({ deployment: { id: 'dep-skip' } }, { status: 201 });
+    }
+    if (init?.method === 'PUT') return Response.json({ success: true });
+    if (url.pathname.endsWith('/finalize')) return Response.json({ release: { id: 'rel-skip' } });
+    if (url.pathname.endsWith('/activate')) {
+      return Response.json({ deployment: { status: 'active', release_id: 'rel-skip' } });
+    }
+    return Response.json({ error: { message: 'unexpected request' } }, { status: 404 });
+  };
+  try {
+    const result = await deployStatic({
+      siteId: 'site-123', cwd: project, outputDir: '.', oversized: 'skip',
+      apiToken: 'shp_test_token', apiBaseUrl: 'https://api.test/v1', fetchImpl,
+      liveWaitTimeoutMs: 0,
+    });
+    assert.deepEqual(result.skipped_files, ['large.bin']);
+    assert.deepEqual(createdManifest?.files.map((file) => file.path), ['index.html']);
+  } finally {
+    rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test('oversized optimize prepares an isolated artifact without modifying source files', async () => {
+  const project = mkdtempSync(join(TMP, 'isolated-optimize-'));
+  const source = join(project, 'hero.png');
+  await sharp({ create: { width: 900, height: 900, channels: 3, noise: { type: 'gaussian' } } })
+    .png().toFile(source);
+  const original = readFileSync(source);
+  const limit = 1024 * 1024;
+  const fetchImpl: typeof fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/v1/account') {
+      return Response.json({ plan: { max_file_size_bytes: limit } });
+    }
+    return Response.json({ error: { message: 'unexpected request' } }, { status: 404 });
+  };
+
+  const prepared = await prepareStaticDeployment({
+    cwd: project, outputDir: '.', apiToken: 'shp_test_token',
+    apiBaseUrl: 'https://api.test/v1', fetchImpl, oversized: 'optimize',
+  });
+  try {
+    assert.notEqual(prepared.outputRoot, project);
+    assert.deepEqual(readFileSync(source), original);
+    assert.ok(prepared.files.find((file) => file.path === 'hero.png')!.size <= limit);
+  } finally {
+    if (prepared.outputRoot !== project) rmSync(prepared.outputRoot, { recursive: true, force: true });
+    rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test('deployStatic resumes staged files and retries a transient upload safely', async () => {
+  const project = mkdtempSync(join(tmpdir(), 'shiplo-mcp-resume-'));
+  const index = Buffer.from('<h1>Already staged</h1>');
+  const script = Buffer.from('console.log("retry")');
+  writeFileSync(join(project, 'index.html'), index);
+  writeFileSync(join(project, 'app.js'), script);
+  let putAttempts = 0;
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (!init?.method && url.pathname === '/v1/sites/site-123') {
+      return Response.json({ site: { hostname: 'fixture.shiplo.site' } });
+    }
+    if (!init?.method && url.pathname === '/v1/deployments/dep-resume') {
+      return Response.json({ deployment: { site_id: 'site-123', status: 'uploading' } });
+    }
+    if (!init?.method && url.pathname === '/v1/deployments/dep-resume/files') {
+      return Response.json({ files: [{
+        path: 'index.html', size: index.length,
+        etag: createHash('sha256').update(index).digest('hex'),
+      }] });
+    }
+    if (init?.method === 'PUT' && url.pathname.endsWith('/app.js')) {
+      putAttempts++;
+      if (putAttempts === 1) throw new TypeError('temporary network failure');
+      return Response.json({ success: true });
+    }
+    if (url.pathname.endsWith('/finalize')) return Response.json({ release: { id: 'rel-resume' } });
+    if (url.pathname.endsWith('/activate')) {
+      return Response.json({ deployment: { status: 'active', release_id: 'rel-resume' } });
+    }
+    return Response.json({ error: { message: 'unexpected request' } }, { status: 404 });
+  };
+
+  try {
+    const result = await deployStatic({
+      siteId: 'site-123', cwd: project, outputDir: '.', apiToken: 'shp_test_token',
+      apiBaseUrl: 'https://api.test/v1', fetchImpl, resumeDeploymentId: 'dep-resume',
+      liveWaitTimeoutMs: 0,
+    });
+    assert.equal(result.resumed, true);
+    assert.equal(putAttempts, 2);
+  } finally {
+    rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test('deployStatic does not retry uploads after the caller cancels', async () => {
+  const project = mkdtempSync(join(TMP, 'cancel-upload-'));
+  writeFileSync(join(project, 'index.html'), '<h1>cancel</h1>');
+  const controller = new AbortController();
+  let putAttempts = 0;
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (!init?.method && url.pathname === '/v1/sites/site-123') {
+      return Response.json({ site: { hostname: null } });
+    }
+    if (init?.method === 'POST' && url.pathname === '/v1/sites/site-123/deployments') {
+      return Response.json({ deployment: { id: 'dep-cancel' } }, { status: 201 });
+    }
+    if (init?.method === 'PUT') {
+      putAttempts++;
+      controller.abort();
+      throw new DOMException('The operation was aborted', 'AbortError');
+    }
+    return Response.json({ error: { message: 'unexpected request' } }, { status: 404 });
+  };
+
+  try {
+    await assert.rejects(deployStatic({
+      siteId: 'site-123', cwd: project, outputDir: '.', apiToken: 'shp_test_token',
+      apiBaseUrl: 'https://api.test/v1', fetchImpl, signal: controller.signal,
+      uploadRetries: 5, liveWaitTimeoutMs: 0,
+    }), /aborted/i);
+    assert.equal(putAttempts, 1);
+  } finally {
+    rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test('waitForLive resolves once the edge stops serving the placeholder', async () => {
   let probes = 0;
   const fetchImpl: typeof fetch = async () => {
@@ -728,6 +964,20 @@ test('waitForLive never throws on network errors and reports the last probe stat
   const probe = await waitForLive('fixture.shiplo.site', fetchImpl, 30, 5);
   assert.equal(probe.live, false);
   assert.match(probe.note ?? '', /ENOTFOUND/);
+});
+
+test('waitForLive stops promptly when the caller cancels', async () => {
+  const controller = new AbortController();
+  const fetchImpl: typeof fetch = async () => {
+    controller.abort(new DOMException('cancel live wait', 'AbortError'));
+    throw new DOMException('cancel live wait', 'AbortError');
+  };
+  const started = Date.now();
+  await assert.rejects(
+    waitForLive('fixture.shiplo.site', fetchImpl, 30_000, 5_000, controller.signal),
+    /cancel live wait/i
+  );
+  assert.ok(Date.now() - started < 1_000);
 });
 
 test('deployStatic holds the URL back until a live probe succeeds', async () => {
